@@ -300,7 +300,7 @@ code,.code{font-family:var(--f-mono);font-size:12.5px;background:var(--sunken);b
    Opcional: pega aquí tus IDs para no tener que escribirlos en cada dispositivo.
    ===================================================================== */
 const CONFIG = {
-  GOOGLE_CLIENT_ID: '',
+  GOOGLE_CLIENT_ID: '966267216177-scn0otud5hm4h9q9uj4566dv8ppsfgel.apps.googleusercontent.com',
   MICROSOFT_CLIENT_ID: '',
 };
 
@@ -564,7 +564,7 @@ const cfg = () => ({ g: String(LS.get('cfg.google', '') || CONFIG.GOOGLE_CLIENT_
 const visibleAccounts = () => S.demo ? DEMO_ACCTS : S.accounts;
 const acctOf = key => S.accounts.find(a => a.key === key) || DEMO_ACCTS.find(a => a.key === key);
 const provOf = a => a.prov === 'google' ? Google : a.prov === 'microsoft' ? Microsoft : Demo;
-function saveAccounts() { LS.set('accounts', S.accounts.map(a => ({ key: a.key, prov: a.prov, email: a.email, addedAt: a.addedAt, lastScan: a.lastScan, count: a.count, folders: a.folders }))); }
+function saveAccounts() { LS.set('accounts', S.accounts.map(a => ({ key: a.key, prov: a.prov, email: a.email, addedAt: a.addedAt, lastScan: a.lastScan, count: a.count, folders: a.folders, historyId: a.historyId }))); }
 
 /* ---------- red ---------- */
 class AuthError extends Error { constructor(acct) { super('La sesión venció'); this.auth = true; this.acct = acct; } }
@@ -623,6 +623,7 @@ const Google = {
     return out;
   },
   async scan(acct, opts, prog) {
+    try { acct.historyId = (await this.api(acct, 'profile')).historyId; } catch (e) { if (e.auth) throw e; }
     const base = opts.scope === 'inbox' ? 'in:inbox' : '-in:trash -in:spam -in:sent -in:drafts -in:chats';
     const ids = await this.listIds(acct, base, opts.max, n => prog('Buscando correos… ' + fmtN(n), 0, 0));
     prog('Revisando adjuntos y respuestas…', 0, 0);
@@ -641,6 +642,60 @@ const Google = {
     const f = parseFrom(H.from || ''); const L = d.labelIds || [];
     const cat = L.includes('CATEGORY_PROMOTIONS') ? 'promotions' : L.includes('CATEGORY_SOCIAL') ? 'social' : L.includes('CATEGORY_UPDATES') ? 'updates' : L.includes('CATEGORY_FORUMS') ? 'forums' : '';
     return { id: acct.key + '|' + d.id, pid: d.id, acct: acct.key, prov: 'google', fromName: f.name, fromEmail: f.email, subject: H.subject || '(sin asunto)', snippet: decodeEntities(d.snippet || ''), date: +d.internalDate, size: d.sizeEstimate || 0, unread: L.includes('UNREAD'), starred: L.includes('STARRED'), gImp: L.includes('IMPORTANT'), attach: att.has(d.id), cat, lu: H['list-unsubscribe'] || '', luPost: /one-click/i.test(H['list-unsubscribe-post'] || ''), replied: sent.has(d.threadId), inbox: L.includes('INBOX'), thread: d.threadId };
+  },
+  metaFields: ['From', 'Subject', 'List-Unsubscribe', 'List-Unsubscribe-Post'].map(h => 'metadataHeaders=' + h).join('&'),
+  async fetchMeta(acct, ids) {
+    const att = new Set((await this.listIds(acct, 'has:attachment newer_than:14d', 600)).map(x => x.id));
+    const sent = new Set((await this.listIds(acct, 'in:sent newer_than:90d', 600)).map(x => x.threadId));
+    const out = [];
+    await pool([...ids], 8, async id => {
+      try { out.push(this.toMsg(acct, await this.api(acct, 'messages/' + id + '?format=metadata&' + this.metaFields + '&fields=id,threadId,labelIds,snippet,sizeEstimate,internalDate,payload/headers'), att, sent)); }
+      catch (e) { if (e.auth) throw e; }
+    });
+    return out;
+  },
+  // Pregunta a Gmail qué cambió desde la última vez. Devuelve {full:true} si el punto de partida ya caducó.
+  async sync(acct) {
+    if (!acct.historyId) return { full: true };
+    const add = new Set(), del = new Set(), upd = new Set();
+    let pageToken = '', hid = acct.historyId;
+    for (let i = 0; i < 25; i++) {
+      let d;
+      try { d = await this.api(acct, 'history?' + qs({ startHistoryId: acct.historyId, maxResults: 500, pageToken })); }
+      catch (e) { if (e.auth) throw e; if (e.status === 404 || e.status === 400) return { full: true }; throw e; }
+      for (const h of d.history || []) {
+        for (const x of h.messagesAdded || []) { add.add(x.message.id); del.delete(x.message.id); }
+        for (const x of h.messagesDeleted || []) { del.add(x.message.id); add.delete(x.message.id); }
+        for (const x of h.labelsAdded || []) {
+          const L = x.labelIds || [];
+          if (L.includes('TRASH') || L.includes('SPAM')) { del.add(x.message.id); add.delete(x.message.id); }
+          else upd.add(x.message.id);
+        }
+        for (const x of h.labelsRemoved || []) {
+          const L = x.labelIds || [];
+          if (L.includes('TRASH') || L.includes('SPAM')) { add.add(x.message.id); del.delete(x.message.id); }
+          else upd.add(x.message.id);
+        }
+      }
+      if (d.historyId) hid = d.historyId;
+      pageToken = d.nextPageToken || '';
+      if (!pageToken) break;
+    }
+    let quitados = 0;
+    for (const pid of del) if (S.msgs.delete(acct.key + '|' + pid)) quitados++;
+    const traer = new Set();
+    for (const pid of add) traer.add(pid);
+    for (const pid of upd) if (!del.has(pid)) traer.add(pid);
+    let nuevos = 0;
+    if (traer.size) {
+      if (traer.size > 800) return { full: true };
+      for (const m of await this.fetchMeta(acct, traer)) {
+        if (!S.msgs.has(m.id)) nuevos++;
+        S.msgs.set(m.id, classify(m));
+      }
+    }
+    acct.historyId = hid; acct.lastScan = Date.now();
+    return { nuevos, quitados, cambios: nuevos + quitados + (traer.size - nuevos) };
   },
   async modify(acct, pids, add, remove, tick) {
     for (const part of chunk(pids, 1000)) { await this.api(acct, 'messages/batchModify', { method: 'POST', body: { ids: part, addLabelIds: add, removeLabelIds: remove } }); tick && tick(part.length); }
@@ -875,6 +930,40 @@ async function scanAccount(acct) {
     if (e.auth) acct.expired = true; else showFlash(acct.email + ': ' + e.message);
   }
   S.scan = null; rebuild(); render();
+}
+
+let sincronizando = false, syncTimer = null;
+async function syncAll(manual) {
+  if (sincronizando || S.scan || S.rv?.stage === 'running') return;
+  const accts = S.accounts.filter(a => a.prov !== 'demo' && !a.expired);
+  if (!accts.length) return;
+  sincronizando = true; S.syncing = true; renderTop();
+  let cambios = 0, tocadas = [];
+  for (const acct of accts) {
+    const tieneCache = [...S.msgs.values()].some(m => m.acct === acct.key);
+    try {
+      if (acct.prov === 'google' && tieneCache && acct.historyId) {
+        const r = await Google.sync(acct);
+        if (r.full) { sincronizando = false; S.syncing = false; await scanAccount(acct); sincronizando = true; S.syncing = true; cambios++; }
+        else if (r.cambios) { cambios += r.cambios; tocadas.push(acct.key); }
+      } else if (!tieneCache || manual || Date.now() - (acct.lastScan || 0) > 18e4) {
+        sincronizando = false; S.syncing = false; await scanAccount(acct); sincronizando = true; S.syncing = true; cambios++;
+      }
+    } catch (e) {
+      if (e.auth) acct.expired = true; else if (manual) showFlash(acct.email + ': ' + e.message);
+    }
+  }
+  for (const k of tocadas) await persistAcct(k);
+  if (tocadas.length) saveAccounts();
+  sincronizando = false; S.syncing = false;
+  if (cambios) { rebuild(); render(); renderSheets(); } else renderTop();
+  return cambios;
+}
+function startAutoSync() {
+  clearInterval(syncTimer);
+  syncTimer = setInterval(() => { if (!document.hidden) syncAll(false); }, 60000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) syncAll(false); });
+  window.addEventListener('online', () => syncAll(false));
 }
 
 /* ---------- ejecutar planes ---------- */
@@ -1140,7 +1229,7 @@ function vAjustes() {
     ${S.accounts.length ? `<div class="list">${S.accounts.map(a => `<div class="item" style="grid-template-columns:auto minmax(0,1fr) auto">
         <span class="avatar pv-${a.prov}">${a.prov === 'google' ? 'G' : 'O'}</span>
         <div class="main"><div class="name">${esc(a.email)}</div><div class="meta">${a.prov === 'google' ? 'Gmail' : 'Outlook / Hotmail'} · ${a.count ? fmtN(a.count) + ' correos analizados' : 'sin analizar'}${a.lastScan ? ' · ' + fmtDate(a.lastScan) : ''}${a.expired ? ' · <b style="color:var(--warn)">sesión vencida</b>' : ''}</div></div>
-        <div class="row-btns" style="justify-content:flex-end">${a.expired ? `<button class="btn sm" data-act="reconnect" data-k="${esc(a.key)}">Reconectar</button>` : `<button class="btn sm" data-act="rescan" data-k="${esc(a.key)}">Analizar</button>`}<button class="btn sm ghost" data-act="remove-acct" data-k="${esc(a.key)}">${S.arm === 'rm:' + a.key ? 'Toca otra vez para quitar' : 'Quitar'}</button></div>
+        <div class="row-btns" style="justify-content:flex-end">${a.expired ? `<button class="btn sm" data-act="reconnect" data-k="${esc(a.key)}">Reconectar</button>` : `<button class="btn sm" data-act="rescan" data-k="${esc(a.key)}">Volver a analizar</button>`}<button class="btn sm ghost" data-act="remove-acct" data-k="${esc(a.key)}">${S.arm === 'rm:' + a.key ? 'Toca otra vez para quitar' : 'Quitar'}</button></div>
       </div>`).join('')}</div>` : `<div class="card flat small">Aún no conectas ninguna cuenta; por ahora ves correos de ejemplo. Puedes conectar varias cuentas de Gmail y de Hotmail/Outlook.</div>`}
     <div class="row-btns">
       <button class="btn ink" data-act="connect" data-p="google"${c.g ? '' : ' disabled'}><span class="avatar pv-google" style="width:22px;height:22px;border-radius:6px;font-size:11px">G</span>Conectar Gmail</button>
@@ -1152,8 +1241,8 @@ function vAjustes() {
     <div class="card flat filters">
       <div class="field"><span class="lab">Qué correos analizar</span><div class="chips">${chip('opt-scope', 'all', S.opts.scope === 'all', 'Todo, menos papelera y spam')}${chip('opt-scope', 'inbox', S.opts.scope === 'inbox', 'Solo bandeja de entrada')}</div></div>
       <div class="field"><span class="lab">Máximo por cuenta (los más recientes)</span><div class="chips">${[500, 1000, 2000, 5000, 10000].map(v => chip('opt-max', v, S.opts.max === v, fmtN(v))).join('')}</div></div>
-      <p class="small muted" style="margin:0">Con 2.000 correos, Gmail tarda cerca de un minuto por cuenta. Outlook es más rápido.</p>
-      ${S.accounts.length ? `<div><button class="btn" data-act="rescan-all">Analizar todas de nuevo</button></div>` : ''}
+      <p class="small muted" style="margin:0">Este análisis completo se hace una sola vez. Después, cada vez que abres Despeja se pone al día sola en un segundo: ve lo que borraste desde otro dispositivo y los correos que llegaron. Mientras la tengas abierta, se refresca cada minuto.</p>
+      ${S.accounts.length ? `<div class="row-btns"><button class="btn" data-act="sync-now">Buscar cambios ahora</button><button class="btn" data-act="rescan-all">Volver a analizar todo</button></div>` : ''}
     </div>
   </section>
   <section class="section"><h2>Conexión</h2>
@@ -1162,7 +1251,7 @@ function vAjustes() {
         <div class="copyrow"><span class="code" id="redir">${esc(REDIRECT)}</span><button class="btn sm" data-act="copy" data-t="${esc(REDIRECT)}">Copiar</button></div>
         ${IS_PREVIEW ? `<p class="small" style="margin:0;color:var(--warn)">Esta es la vista previa: aquí solo funcionan los correos de ejemplo. Para tus cuentas, publica tu copia (parte 1 de la guía) y usa esa dirección.</p>` : ''}
       </div>
-      <div class="field"><label for="cfg-g">ID de cliente de Google</label><input id="cfg-g" class="input mono" placeholder="123456789-abc.apps.googleusercontent.com" value="${esc(c.g)}" autocomplete="off" spellcheck="false"></div>
+      <div class="field"><label for="cfg-g">ID de cliente de Google</label><input id="cfg-g" class="input mono" placeholder="123456789-abc.apps.googleusercontent.com" value="${esc(c.g)}" autocomplete="off" spellcheck="false">${CONFIG.GOOGLE_CLIENT_ID ? '<span class="small muted">Ya viene configurado. No tienes que tocarlo en ningún dispositivo.</span>' : ''}</div>
       <div class="field"><label for="cfg-m">ID de aplicación (cliente) de Microsoft</label><input id="cfg-m" class="input mono" placeholder="00000000-0000-0000-0000-000000000000" value="${esc(c.m)}" autocomplete="off" spellcheck="false"></div>
       <div><button class="btn ink" data-act="save-cfg">Guardar IDs</button></div>
     </div>
@@ -1173,6 +1262,7 @@ function vAjustes() {
     <div class="card flat" style="display:flex;flex-direction:column;gap:10px;font-size:14px">
       <p style="margin:0">Despeja no tiene servidor: corre en este dispositivo y habla directo con Google y Microsoft. Guarda aquí, en el navegador, un índice de tus correos (remitente, asunto y vista previa) para no tener que analizarlos cada vez.</p>
       <p style="margin:0">Nada se borra para siempre: todo va a la papelera de tu correo, donde puedes recuperarlo durante 30 días.</p>
+      <p style="margin:0">Todos tus dispositivos muestran lo mismo porque todos leen de tu cuenta de correo, no de una copia. Si borras algo en el celular, el PC lo ve apenas lo abres.</p>
       <div><button class="btn sm" data-act="wipe">${S.arm === 'wipe' ? 'Toca otra vez para borrar todo' : 'Borrar los datos de este dispositivo'}</button></div>
     </div>
   </section>`;
@@ -1212,7 +1302,7 @@ function guide() {
     <ol class="steps">
       <li><div>Abre tu dirección de GitHub Pages en <b>Safari</b>.</div></li>
       <li><div>Toca <b>Compartir</b> → <b>Agregar a pantalla de inicio</b> → <b>Agregar</b>.</div></li>
-      <li><div>Abre Despeja desde el ícono. La app instalada guarda sus datos aparte de Safari, así que pega los IDs otra vez en Ajustes (o escríbelos una sola vez en las líneas <code>GOOGLE_CLIENT_ID</code> y <code>MICROSOFT_CLIENT_ID</code> al inicio de index.html, con el lápiz de GitHub).</div></li>
+      <li><div>Abre Despeja desde el ícono y toca <b>Conectar Gmail</b>. El ID ya viene puesto, así que no tienes que pegar nada: en cualquier dispositivo solo entras con tu cuenta.</div></li>
     </ol></details>
   </div>`;
 }
@@ -1463,6 +1553,7 @@ function renderTop() {
   const sc = S.scan;
   $('#top').innerHTML = `<div class="top-row"><div class="wordmark"><span class="mark" aria-hidden="true"></span>Despeja</div>
     <div class="acct-chips">${accts.map(a => `<span class="achip${a.expired ? ' exp' : ''}" title="${esc(a.email)}"><b class="pv-${a.icon || a.prov}">${(a.icon || a.prov) === 'google' ? 'G' : 'O'}</b><span>${esc(shortEmail(a.email))}</span></span>`).join('')}</div></div>
+    ${!sc && S.syncing ? `<div class="status-line"><span><span class="spinner" style="width:11px;height:11px;vertical-align:-1px"></span> Buscando cambios en tu correo…</span><span></span></div>` : ''}
     ${sc ? `<div class="status-line"><span>${esc(sc.label)} · ${esc(sc.text)}</span><span class="num">${sc.total ? fmtN(sc.done) + ' / ' + fmtN(sc.total) : ''}</span></div><div class="progress"><i style="width:${sc.total ? Math.max(4, Math.round(100 * sc.done / sc.total)) : 6}%"></i></div>` : ''}
     ${accts.filter(a => a.expired).map(a => `<div class="banner warn"><div class="grow">La sesión de <b>${esc(a.email)}</b> se cerró (${a.prov === 'google' ? 'Google la cierra cada hora' : 'pasó más de un día'}). Tus datos siguen aquí; para borrar o mover, reconéctala.</div><button class="btn sm" data-act="reconnect" data-k="${esc(a.key)}">Reconectar</button></div>`).join('')}
     ${S.flash ? `<div class="banner warn"><div class="grow">${esc(S.flash)}</div><button class="btn sm ghost" data-act="flash-x" aria-label="Cerrar aviso">${IC.close.replace('<svg', '<svg width="16" height="16"')}</button></div>` : ''}`;
@@ -1610,6 +1701,7 @@ document.addEventListener('click', async e => {
     case 'reconnect': { const a = acctOf(el.dataset.k); if (a) connect(a.prov, a.email); break; }
     case 'rescan': { const a = acctOf(el.dataset.k); if (a && !S.scan) scanAccount(a); break; }
     case 'rescan-all': for (const a of S.accounts) if (!a.expired) await scanAccount(a); break;
+    case 'sync-now': { const n = await syncAll(true); showToast(n ? 'Listo: ' + fmtN(n) + ' ' + plural(n, 'cambio', 'cambios') + '.' : 'Ya estabas al día.'); break; }
     case 'remove-acct': {
       const k = el.dataset.k;
       if (S.arm !== 'rm:' + k) { S.arm = 'rm:' + k; render(); break; }
@@ -1683,6 +1775,8 @@ async function init() {
     if (ret.isNew || !has) { S.view = 'inicio'; render(); await scanAccount(ret.acct); }
     else showToast('Cuenta reconectada: ' + ret.acct.email);
   }
+  startAutoSync();
+  syncAll(false);
 }
 
 /* ---------- correos de ejemplo (se generan en el dispositivo; nada es real) ---------- */
